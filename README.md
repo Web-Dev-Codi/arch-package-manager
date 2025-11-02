@@ -29,7 +29,7 @@ A beautiful terminal-based package manager for Arch Linux that searches both off
 
 1. **Run the installation script:**
    ```bash
-   cd /home/webdevcodi/arch-package-manager
+   cd /arch-package-manager
    ./install.sh
    ```
 
