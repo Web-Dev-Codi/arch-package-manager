@@ -12,6 +12,7 @@ import shutil
 from functools import lru_cache
 import threading
 import requests
+import time
 
 try:
     from rich.console import Console
@@ -47,28 +48,48 @@ class ArchPackageManager:
         self.selected_idx = 0
         self.search_query = ""
         self.state = "search"  # search, installing, complete
-        self.output_lines = []
+        self.output_lines = []  # List of tuples: (line_text, color_pair)
         self.output_scroll_offset = 0
         self.install_success = False
         self.details_scroll_offset = 0
         self.db_loaded = False
         self.details_cache: Dict[str, dict] = {}  # Cache for package details
+        self.last_render_time = 0
+        self.pending_output_lines = []  # Buffer for batched updates
         # AUR search state
         self.aur_results: List[Package] = []
         self.aur_thread: Optional[threading.Thread] = None
         self.aur_pending = False
         self.aur_last_query = ""
         self.aur_loading = False
+        self.aur_search_cache: Dict[str, List[Package]] = {}  # Cache AUR search results
+        self.aur_debounce_timer = 0.0  # Debounce timer for search
+        self.aur_debounce_delay = 0.3  # Wait 300ms after user stops typing
+        self.last_search_time = 0.0
+        
+        # HTTP session for connection pooling and faster requests
+        self.http_session = requests.Session()
+        self.http_session.headers.update({
+            'User-Agent': 'arch-pkg-manager/1.0',
+            'Accept': 'application/json'
+        })
+        
+        # Minimum query length before searching AUR (reduces unnecessary requests)
+        self.min_aur_query_length = 2
         
         # Initialize colors
         curses.start_color()
         curses.use_default_colors()
         curses.init_pair(1, curses.COLOR_CYAN, -1)      # Header
-        curses.init_pair(2, curses.COLOR_GREEN, -1)     # Official repo
-        curses.init_pair(3, curses.COLOR_YELLOW, -1)    # AUR
+        curses.init_pair(2, curses.COLOR_GREEN, -1)     # Official repo / Success
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)    # AUR / Warning
         curses.init_pair(4, curses.COLOR_WHITE, -1)     # Normal text
         curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_CYAN)  # Selected
         curses.init_pair(6, curses.COLOR_RED, -1)       # Error
+        curses.init_pair(7, curses.COLOR_BLUE, -1)      # Info / Downloading
+        curses.init_pair(8, curses.COLOR_MAGENTA, -1)   # Package names / Installing
+        curses.init_pair(9, curses.COLOR_GREEN, -1)     # Success messages
+        curses.init_pair(10, curses.COLOR_YELLOW, -1)   # Warnings
         
         # Hide cursor
         curses.curs_set(0)
@@ -76,8 +97,9 @@ class ArchPackageManager:
         # Set timeout for getch
         self.stdscr.timeout(100)
         
-        # Load package database on init (in background)
-        self.load_package_database()
+        # Load package database on init (in background thread to avoid blocking)
+        db_thread = threading.Thread(target=self.load_package_database, daemon=True)
+        db_thread.start()
         
     def load_package_database(self):
         """Load all packages once for fast local filtering"""
@@ -157,30 +179,73 @@ class ArchPackageManager:
         return ""
     
     def filter_packages(self, query: str) -> List[Package]:
-        """Fast local filtering of packages - case insensitive exact letter matching"""
-        if not query:
+        """Fast local filtering of packages - optimized with early termination"""
+        if not query or len(query) < 1:
             return []
         
         query_lower = query.lower()
+        query_len = len(query_lower)
         filtered = []
         
+        # Pre-compile lowercase names for faster matching
+        # Use startswith for better performance on short queries
+        use_startswith = query_len <= 3
+        
         for pkg in self.all_packages:
-            # Case-insensitive matching: check if query is in package name
-            if query_lower in pkg.name.lower():
-                filtered.append(pkg)
-                if len(filtered) >= 100:  # Limit results for performance
-                    break
+            pkg_name_lower = pkg.name.lower()
+            
+            # Optimize: use startswith for short queries (faster)
+            if use_startswith:
+                if pkg_name_lower.startswith(query_lower):
+                    filtered.append(pkg)
+            else:
+                # For longer queries, substring search is fine
+                if query_lower in pkg_name_lower:
+                    filtered.append(pkg)
+            
+            # Early termination when we have enough results
+            if len(filtered) >= 100:
+                break
         
         return filtered
 
-    def start_aur_search(self, query: str):
-        """Fetch AUR results for the current query in the background using the AUR RPC API."""
-        # Clear if no query
-        if not query:
+    def start_aur_search(self, query: str, immediate: bool = False):
+        """Fetch AUR results for the current query in the background using the AUR RPC API.
+        
+        Args:
+            query: Search query string
+            immediate: If True, skip debouncing and search immediately
+        """
+        # Clear if no query or query too short
+        if not query or len(query) < self.min_aur_query_length:
             self.aur_results = []
+            # Still show local results
+            self.filtered_packages = self.filter_packages(query)
+            self.selected_idx = 0
+            self.aur_last_query = ""  # Clear pending search
             return
         
-        # If a previous AUR search is running, mark pending and queue latest query
+        # Check cache first (only if immediate, to avoid cache hits during debouncing)
+        if immediate:
+            query_lower = query.lower()
+            if query_lower in self.aur_search_cache:
+                cached_results = self.aur_search_cache[query_lower]
+                self.aur_results = cached_results
+                # Merge local and cached AUR results
+                local = self.filter_packages(query)
+                take_from_aur = max(0, 100 - len(local))
+                self.filtered_packages = local + cached_results[:take_from_aur]
+                self.selected_idx = 0
+                return
+        
+        # Debouncing: don't search immediately, wait for user to stop typing
+        if not immediate:
+            # Store the query and update timestamp for debouncing
+            self.aur_last_query = query
+            self.last_search_time = time.time()
+            return
+        
+        # If a previous AUR search is running, cancel it and start new one
         if self.aur_thread and self.aur_thread.is_alive():
             self.aur_pending = True
             self.aur_last_query = query
@@ -193,8 +258,9 @@ class ArchPackageManager:
             self.aur_loading = True
             results: List[Package] = []
             try:
+                # Use session for connection pooling and faster requests
                 url = f"https://aur.archlinux.org/rpc/?v=5&type=search&by=name&arg={captured_query}"
-                resp = requests.get(url, timeout=4)
+                resp = self.http_session.get(url, timeout=2)  # Reduced timeout from 4s to 2s
                 if resp.status_code == 200:
                     data = resp.json()
                     for item in data.get('results', [])[:200]:
@@ -206,6 +272,14 @@ class ArchPackageManager:
                             results.append(Package(name, version, 'aur', desc, 'aur'))
                             if len(results) >= 100:
                                 break
+                    
+                    # Cache the results
+                    self.aur_search_cache[q_lower] = results
+                    # Limit cache size to prevent memory issues
+                    if len(self.aur_search_cache) > 100:
+                        # Remove oldest entries (simple FIFO)
+                        oldest_key = next(iter(self.aur_search_cache))
+                        del self.aur_search_cache[oldest_key]
             except Exception:
                 # Ignore network errors silently; keep previous AUR results
                 pass
@@ -223,7 +297,7 @@ class ArchPackageManager:
             # Handle pending search
             if self.aur_pending:
                 self.aur_pending = False
-                self.start_aur_search(self.aur_last_query)
+                self.start_aur_search(self.aur_last_query, immediate=True)
         
         self.aur_last_query = query
         self.aur_thread = threading.Thread(target=worker, daemon=True)
@@ -326,12 +400,72 @@ class ArchPackageManager:
         self.details_cache[cache_key] = details
         return details
     
+    def parse_output_color(self, line: str) -> int:
+        """Parse installation output line and return appropriate color pair"""
+        line_lower = line.lower()
+        line_stripped = line.strip()
+        
+        # Errors - red (check first, highest priority)
+        if any(keyword in line_lower for keyword in ['error', 'failed', 'failure', 'cannot', 'unable', 'not found', 
+                                                      'not available', 'aborting', 'abort', 'invalid', 'missing']):
+            return curses.color_pair(6) | curses.A_BOLD
+        
+        # Warnings - yellow
+        if any(keyword in line_lower for keyword in ['warning', 'warn', 'conflict', 'overwrite', 'exists', 
+                                                      'already installed', 'skipping', 'ignoring']):
+            return curses.color_pair(10) | curses.A_BOLD
+        
+        # Success messages - green
+        if any(keyword in line_lower for keyword in ['installed', 'upgraded', 'completed', 'done', 'succeeded', 
+                                                      'success', 'finished', 'ready', 'ok']):
+            return curses.color_pair(9) | curses.A_BOLD
+        
+        # Pacman/yay specific patterns
+        # Package database operations - cyan
+        if line_stripped.startswith('::') or line_stripped.startswith('==>') or line_stripped.startswith('->'):
+            return curses.color_pair(1) | curses.A_BOLD
+        
+        # Downloading/Progress - blue (check for download indicators)
+        if any(keyword in line_lower for keyword in ['downloading', 'downloaded', 'download', 'fetching', 
+                                                      'retrieving', 'receiving', 'extracting']):
+            return curses.color_pair(7)
+        
+        # Progress bars and percentages - blue
+        if '%' in line or 'kb/s' in line_lower or 'mb/s' in line_lower or 'rate' in line_lower:
+            return curses.color_pair(7)
+        
+        # Installing/Processing - magenta
+        if any(keyword in line_lower for keyword in ['installing', 'installing packages', 'checking', 'resolving', 
+                                                      'loading', 'processing', 'preparing', 'building', 'compiling']):
+            return curses.color_pair(8)
+        
+        # Package names in brackets - cyan (pacman format: [repo/package])
+        if re.match(r'^\s*\[.*/.*\]\s+', line):
+            return curses.color_pair(1)
+        
+        # Version numbers or package info lines - cyan
+        if re.match(r'^\s*\d+\.\d+', line) or re.match(r'^\s*[a-z]+/[a-z0-9-]+', line_lower):
+            return curses.color_pair(1)
+        
+        # Dependency resolution - magenta
+        if any(keyword in line_lower for keyword in ['dependency', 'dependencies', 'required by', 'optional for']):
+            return curses.color_pair(8)
+        
+        # Repository/sync operations - cyan
+        if any(keyword in line_lower for keyword in ['repository', 'sync', 'database', 'updating', 'upgrade']):
+            return curses.color_pair(1)
+        
+        # Default - white
+        return curses.color_pair(4)
+    
     def install_package(self, package: Package):
         """Install a package and capture output"""
         self.state = "installing"
         self.output_lines = []
         self.output_scroll_offset = 0
         self.current_package = package
+        self.pending_output_lines = []
+        self.last_render_time = time.time()
         self.stdscr.clear()
         
         if package.source == 'official':
@@ -348,20 +482,39 @@ class ArchPackageManager:
                 bufsize=1
             )
             
+            # Batch updates to reduce rendering overhead
+            BATCH_INTERVAL = 0.05  # Render every 50ms max
+            MAX_BATCH_SIZE = 5     # Or every 5 lines
+            
             for line in iter(process.stdout.readline, ''):
                 if line:
-                    self.output_lines.append(line.rstrip())
+                    line_stripped = line.rstrip()
+                    color = self.parse_output_color(line_stripped)
+                    self.output_lines.append((line_stripped, color))
+                    self.pending_output_lines.append((line_stripped, color))
+                    
                     # Auto-scroll to bottom while installing
                     height, _ = self.stdscr.getmaxyx()
                     visible_lines = height - 7
                     self.output_scroll_offset = max(0, len(self.output_lines) - visible_lines)
-                    self.draw_install_screen(package)
+                    
+                    # Batch updates: render if enough time passed or enough lines accumulated
+                    current_time = time.time()
+                    if (len(self.pending_output_lines) >= MAX_BATCH_SIZE or 
+                        (current_time - self.last_render_time) >= BATCH_INTERVAL):
+                        self.draw_install_screen(package)
+                        self.pending_output_lines = []
+                        self.last_render_time = current_time
             
+            # Final render
+            self.draw_install_screen(package)
             process.wait()
             self.install_success = (process.returncode == 0)
             
         except Exception as e:
-            self.output_lines.append(f"\nError: {str(e)}")
+            error_line = f"\nError: {str(e)}"
+            error_color = curses.color_pair(6) | curses.A_BOLD
+            self.output_lines.append((error_line, error_color))
             self.install_success = False
         
         self.state = "complete"
@@ -577,25 +730,33 @@ class ArchPackageManager:
         
         # Check if there's a sudo password prompt in recent output
         sudo_prompt = None
-        for line in self.output_lines[-5:]:  # Check last 5 lines
-            if '[sudo]' in line.lower() and 'password' in line.lower():
-                sudo_prompt = line.strip()
+        for line_data in self.output_lines[-5:]:  # Check last 5 lines
+            line_text = line_data[0] if isinstance(line_data, tuple) else line_data
+            if '[sudo]' in line_text.lower() and 'password' in line_text.lower():
+                sudo_prompt = line_text.strip()
                 break
         
-        for i, line in enumerate(display_lines):
+        for i, line_data in enumerate(display_lines):
             y = start_line + i
             if y >= height - 3:  # Leave room for sudo prompt
                 break
             
+            # Handle both tuple format (line, color) and legacy string format
+            if isinstance(line_data, tuple):
+                line_text, line_color = line_data
+            else:
+                line_text = line_data
+                line_color = curses.color_pair(4)
+            
             # Skip sudo password lines from regular output (they'll be shown at bottom)
-            if '[sudo]' in line.lower() and 'password' in line.lower():
+            if '[sudo]' in line_text.lower() and 'password' in line_text.lower():
                 continue
             
             # Truncate long lines
-            if len(line) > width - 4:
-                line = line[:width-7] + "..."
+            if len(line_text) > width - 4:
+                line_text = line_text[:width-7] + "..."
             
-            self.stdscr.addstr(y, 2, line, curses.color_pair(4))
+            self.stdscr.addstr(y, 2, line_text, line_color)
         
         # Display sudo password prompt at the bottom in green if present
         if sudo_prompt and self.state == "installing":
@@ -630,6 +791,15 @@ class ArchPackageManager:
         """Main application loop"""
         while True:
             if self.state == "search":
+                # Check debounce timer and trigger AUR search if needed
+                if self.aur_last_query and self.aur_last_query == self.search_query:
+                    current_time = time.time()
+                    time_since_last_keystroke = current_time - self.last_search_time
+                    if time_since_last_keystroke >= self.aur_debounce_delay:
+                        # User has stopped typing, trigger the search
+                        self.start_aur_search(self.search_query, immediate=True)
+                        self.aur_last_query = ""  # Clear to prevent re-triggering
+                
                 self.draw_search_screen()
                 
                 key = self.stdscr.getch()
@@ -656,23 +826,24 @@ class ArchPackageManager:
                 elif key == curses.KEY_BACKSPACE or key == 127 or key == 263 or key == 8:
                     if self.search_query:
                         self.search_query = self.search_query[:-1]
-                        # Instant local filter
+                        # Instant local filter (no HTTP request)
                         self.filtered_packages = self.filter_packages(self.search_query)
                         self.selected_idx = 0
                         self.details_scroll_offset = 0
-                        # Kick off AUR search
+                        # Schedule AUR search with debouncing
                         self.start_aur_search(self.search_query)
                     else:
                         # Clear results when query empty
                         self.filtered_packages = []
+                        self.aur_results = []
                         self.start_aur_search("")
                 elif key != -1 and 32 <= key <= 126:  # Printable characters
                     self.search_query += chr(key)
-                    # Instant local filter
+                    # Instant local filter (no HTTP request)
                     self.filtered_packages = self.filter_packages(self.search_query)
                     self.selected_idx = 0
                     self.details_scroll_offset = 0
-                    # Kick off AUR search
+                    # Schedule AUR search with debouncing (will trigger after delay)
                     self.start_aur_search(self.search_query)
             
             elif self.state == "installing" or self.state == "complete":
@@ -703,10 +874,12 @@ class ArchPackageManager:
                     # Return to search view to perform another search
                     self.state = "search"
                     self.output_lines = []
+                    self.pending_output_lines = []
                     self.output_scroll_offset = 0
                     # Refresh filter and (optionally) AUR search for current query
                     self.filtered_packages = self.filter_packages(self.search_query)
-                    self.start_aur_search(self.search_query)
+                    if self.search_query:
+                        self.start_aur_search(self.search_query, immediate=True)
 
 
 def main(stdscr):
