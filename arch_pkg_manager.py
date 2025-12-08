@@ -12,6 +12,7 @@ import shutil
 from functools import lru_cache
 import threading
 import requests
+import time
 
 try:
     from rich.console import Console
@@ -61,6 +62,20 @@ class ArchPackageManager:
         self.aur_pending = False
         self.aur_last_query = ""
         self.aur_loading = False
+        self.aur_search_cache: Dict[str, List[Package]] = {}  # Cache AUR search results
+        self.aur_debounce_timer = 0.0  # Debounce timer for search
+        self.aur_debounce_delay = 0.3  # Wait 300ms after user stops typing
+        self.last_search_time = 0.0
+        
+        # HTTP session for connection pooling and faster requests
+        self.http_session = requests.Session()
+        self.http_session.headers.update({
+            'User-Agent': 'arch-pkg-manager/1.0',
+            'Accept': 'application/json'
+        })
+        
+        # Minimum query length before searching AUR (reduces unnecessary requests)
+        self.min_aur_query_length = 2
         
         # Initialize colors
         curses.start_color()
@@ -82,8 +97,9 @@ class ArchPackageManager:
         # Set timeout for getch
         self.stdscr.timeout(100)
         
-        # Load package database on init (in background)
-        self.load_package_database()
+        # Load package database on init (in background thread to avoid blocking)
+        db_thread = threading.Thread(target=self.load_package_database, daemon=True)
+        db_thread.start()
         
     def load_package_database(self):
         """Load all packages once for fast local filtering"""
@@ -163,30 +179,73 @@ class ArchPackageManager:
         return ""
     
     def filter_packages(self, query: str) -> List[Package]:
-        """Fast local filtering of packages - case insensitive exact letter matching"""
-        if not query:
+        """Fast local filtering of packages - optimized with early termination"""
+        if not query or len(query) < 1:
             return []
         
         query_lower = query.lower()
+        query_len = len(query_lower)
         filtered = []
         
+        # Pre-compile lowercase names for faster matching
+        # Use startswith for better performance on short queries
+        use_startswith = query_len <= 3
+        
         for pkg in self.all_packages:
-            # Case-insensitive matching: check if query is in package name
-            if query_lower in pkg.name.lower():
-                filtered.append(pkg)
-                if len(filtered) >= 100:  # Limit results for performance
-                    break
+            pkg_name_lower = pkg.name.lower()
+            
+            # Optimize: use startswith for short queries (faster)
+            if use_startswith:
+                if pkg_name_lower.startswith(query_lower):
+                    filtered.append(pkg)
+            else:
+                # For longer queries, substring search is fine
+                if query_lower in pkg_name_lower:
+                    filtered.append(pkg)
+            
+            # Early termination when we have enough results
+            if len(filtered) >= 100:
+                break
         
         return filtered
 
-    def start_aur_search(self, query: str):
-        """Fetch AUR results for the current query in the background using the AUR RPC API."""
-        # Clear if no query
-        if not query:
+    def start_aur_search(self, query: str, immediate: bool = False):
+        """Fetch AUR results for the current query in the background using the AUR RPC API.
+        
+        Args:
+            query: Search query string
+            immediate: If True, skip debouncing and search immediately
+        """
+        # Clear if no query or query too short
+        if not query or len(query) < self.min_aur_query_length:
             self.aur_results = []
+            # Still show local results
+            self.filtered_packages = self.filter_packages(query)
+            self.selected_idx = 0
+            self.aur_last_query = ""  # Clear pending search
             return
         
-        # If a previous AUR search is running, mark pending and queue latest query
+        # Check cache first (only if immediate, to avoid cache hits during debouncing)
+        if immediate:
+            query_lower = query.lower()
+            if query_lower in self.aur_search_cache:
+                cached_results = self.aur_search_cache[query_lower]
+                self.aur_results = cached_results
+                # Merge local and cached AUR results
+                local = self.filter_packages(query)
+                take_from_aur = max(0, 100 - len(local))
+                self.filtered_packages = local + cached_results[:take_from_aur]
+                self.selected_idx = 0
+                return
+        
+        # Debouncing: don't search immediately, wait for user to stop typing
+        if not immediate:
+            # Store the query and update timestamp for debouncing
+            self.aur_last_query = query
+            self.last_search_time = time.time()
+            return
+        
+        # If a previous AUR search is running, cancel it and start new one
         if self.aur_thread and self.aur_thread.is_alive():
             self.aur_pending = True
             self.aur_last_query = query
@@ -199,8 +258,9 @@ class ArchPackageManager:
             self.aur_loading = True
             results: List[Package] = []
             try:
+                # Use session for connection pooling and faster requests
                 url = f"https://aur.archlinux.org/rpc/?v=5&type=search&by=name&arg={captured_query}"
-                resp = requests.get(url, timeout=4)
+                resp = self.http_session.get(url, timeout=2)  # Reduced timeout from 4s to 2s
                 if resp.status_code == 200:
                     data = resp.json()
                     for item in data.get('results', [])[:200]:
@@ -212,6 +272,14 @@ class ArchPackageManager:
                             results.append(Package(name, version, 'aur', desc, 'aur'))
                             if len(results) >= 100:
                                 break
+                    
+                    # Cache the results
+                    self.aur_search_cache[q_lower] = results
+                    # Limit cache size to prevent memory issues
+                    if len(self.aur_search_cache) > 100:
+                        # Remove oldest entries (simple FIFO)
+                        oldest_key = next(iter(self.aur_search_cache))
+                        del self.aur_search_cache[oldest_key]
             except Exception:
                 # Ignore network errors silently; keep previous AUR results
                 pass
@@ -229,7 +297,7 @@ class ArchPackageManager:
             # Handle pending search
             if self.aur_pending:
                 self.aur_pending = False
-                self.start_aur_search(self.aur_last_query)
+                self.start_aur_search(self.aur_last_query, immediate=True)
         
         self.aur_last_query = query
         self.aur_thread = threading.Thread(target=worker, daemon=True)
@@ -392,8 +460,6 @@ class ArchPackageManager:
     
     def install_package(self, package: Package):
         """Install a package and capture output"""
-        import time
-        
         self.state = "installing"
         self.output_lines = []
         self.output_scroll_offset = 0
@@ -725,6 +791,15 @@ class ArchPackageManager:
         """Main application loop"""
         while True:
             if self.state == "search":
+                # Check debounce timer and trigger AUR search if needed
+                if self.aur_last_query and self.aur_last_query == self.search_query:
+                    current_time = time.time()
+                    time_since_last_keystroke = current_time - self.last_search_time
+                    if time_since_last_keystroke >= self.aur_debounce_delay:
+                        # User has stopped typing, trigger the search
+                        self.start_aur_search(self.search_query, immediate=True)
+                        self.aur_last_query = ""  # Clear to prevent re-triggering
+                
                 self.draw_search_screen()
                 
                 key = self.stdscr.getch()
@@ -751,23 +826,24 @@ class ArchPackageManager:
                 elif key == curses.KEY_BACKSPACE or key == 127 or key == 263 or key == 8:
                     if self.search_query:
                         self.search_query = self.search_query[:-1]
-                        # Instant local filter
+                        # Instant local filter (no HTTP request)
                         self.filtered_packages = self.filter_packages(self.search_query)
                         self.selected_idx = 0
                         self.details_scroll_offset = 0
-                        # Kick off AUR search
+                        # Schedule AUR search with debouncing
                         self.start_aur_search(self.search_query)
                     else:
                         # Clear results when query empty
                         self.filtered_packages = []
+                        self.aur_results = []
                         self.start_aur_search("")
                 elif key != -1 and 32 <= key <= 126:  # Printable characters
                     self.search_query += chr(key)
-                    # Instant local filter
+                    # Instant local filter (no HTTP request)
                     self.filtered_packages = self.filter_packages(self.search_query)
                     self.selected_idx = 0
                     self.details_scroll_offset = 0
-                    # Kick off AUR search
+                    # Schedule AUR search with debouncing (will trigger after delay)
                     self.start_aur_search(self.search_query)
             
             elif self.state == "installing" or self.state == "complete":
@@ -802,7 +878,8 @@ class ArchPackageManager:
                     self.output_scroll_offset = 0
                     # Refresh filter and (optionally) AUR search for current query
                     self.filtered_packages = self.filter_packages(self.search_query)
-                    self.start_aur_search(self.search_query)
+                    if self.search_query:
+                        self.start_aur_search(self.search_query, immediate=True)
 
 
 def main(stdscr):
