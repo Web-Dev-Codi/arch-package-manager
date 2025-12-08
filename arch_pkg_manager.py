@@ -47,12 +47,14 @@ class ArchPackageManager:
         self.selected_idx = 0
         self.search_query = ""
         self.state = "search"  # search, installing, complete
-        self.output_lines = []
+        self.output_lines = []  # List of tuples: (line_text, color_pair)
         self.output_scroll_offset = 0
         self.install_success = False
         self.details_scroll_offset = 0
         self.db_loaded = False
         self.details_cache: Dict[str, dict] = {}  # Cache for package details
+        self.last_render_time = 0
+        self.pending_output_lines = []  # Buffer for batched updates
         # AUR search state
         self.aur_results: List[Package] = []
         self.aur_thread: Optional[threading.Thread] = None
@@ -64,11 +66,15 @@ class ArchPackageManager:
         curses.start_color()
         curses.use_default_colors()
         curses.init_pair(1, curses.COLOR_CYAN, -1)      # Header
-        curses.init_pair(2, curses.COLOR_GREEN, -1)     # Official repo
-        curses.init_pair(3, curses.COLOR_YELLOW, -1)    # AUR
+        curses.init_pair(2, curses.COLOR_GREEN, -1)     # Official repo / Success
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)    # AUR / Warning
         curses.init_pair(4, curses.COLOR_WHITE, -1)     # Normal text
         curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_CYAN)  # Selected
         curses.init_pair(6, curses.COLOR_RED, -1)       # Error
+        curses.init_pair(7, curses.COLOR_BLUE, -1)      # Info / Downloading
+        curses.init_pair(8, curses.COLOR_MAGENTA, -1)   # Package names / Installing
+        curses.init_pair(9, curses.COLOR_GREEN, -1)     # Success messages
+        curses.init_pair(10, curses.COLOR_YELLOW, -1)   # Warnings
         
         # Hide cursor
         curses.curs_set(0)
@@ -326,12 +332,74 @@ class ArchPackageManager:
         self.details_cache[cache_key] = details
         return details
     
+    def parse_output_color(self, line: str) -> int:
+        """Parse installation output line and return appropriate color pair"""
+        line_lower = line.lower()
+        line_stripped = line.strip()
+        
+        # Errors - red (check first, highest priority)
+        if any(keyword in line_lower for keyword in ['error', 'failed', 'failure', 'cannot', 'unable', 'not found', 
+                                                      'not available', 'aborting', 'abort', 'invalid', 'missing']):
+            return curses.color_pair(6) | curses.A_BOLD
+        
+        # Warnings - yellow
+        if any(keyword in line_lower for keyword in ['warning', 'warn', 'conflict', 'overwrite', 'exists', 
+                                                      'already installed', 'skipping', 'ignoring']):
+            return curses.color_pair(10) | curses.A_BOLD
+        
+        # Success messages - green
+        if any(keyword in line_lower for keyword in ['installed', 'upgraded', 'completed', 'done', 'succeeded', 
+                                                      'success', 'finished', 'ready', 'ok']):
+            return curses.color_pair(9) | curses.A_BOLD
+        
+        # Pacman/yay specific patterns
+        # Package database operations - cyan
+        if line_stripped.startswith('::') or line_stripped.startswith('==>') or line_stripped.startswith('->'):
+            return curses.color_pair(1) | curses.A_BOLD
+        
+        # Downloading/Progress - blue (check for download indicators)
+        if any(keyword in line_lower for keyword in ['downloading', 'downloaded', 'download', 'fetching', 
+                                                      'retrieving', 'receiving', 'extracting']):
+            return curses.color_pair(7)
+        
+        # Progress bars and percentages - blue
+        if '%' in line or 'kb/s' in line_lower or 'mb/s' in line_lower or 'rate' in line_lower:
+            return curses.color_pair(7)
+        
+        # Installing/Processing - magenta
+        if any(keyword in line_lower for keyword in ['installing', 'installing packages', 'checking', 'resolving', 
+                                                      'loading', 'processing', 'preparing', 'building', 'compiling']):
+            return curses.color_pair(8)
+        
+        # Package names in brackets - cyan (pacman format: [repo/package])
+        if re.match(r'^\s*\[.*/.*\]\s+', line):
+            return curses.color_pair(1)
+        
+        # Version numbers or package info lines - cyan
+        if re.match(r'^\s*\d+\.\d+', line) or re.match(r'^\s*[a-z]+/[a-z0-9-]+', line_lower):
+            return curses.color_pair(1)
+        
+        # Dependency resolution - magenta
+        if any(keyword in line_lower for keyword in ['dependency', 'dependencies', 'required by', 'optional for']):
+            return curses.color_pair(8)
+        
+        # Repository/sync operations - cyan
+        if any(keyword in line_lower for keyword in ['repository', 'sync', 'database', 'updating', 'upgrade']):
+            return curses.color_pair(1)
+        
+        # Default - white
+        return curses.color_pair(4)
+    
     def install_package(self, package: Package):
         """Install a package and capture output"""
+        import time
+        
         self.state = "installing"
         self.output_lines = []
         self.output_scroll_offset = 0
         self.current_package = package
+        self.pending_output_lines = []
+        self.last_render_time = time.time()
         self.stdscr.clear()
         
         if package.source == 'official':
@@ -348,20 +416,39 @@ class ArchPackageManager:
                 bufsize=1
             )
             
+            # Batch updates to reduce rendering overhead
+            BATCH_INTERVAL = 0.05  # Render every 50ms max
+            MAX_BATCH_SIZE = 5     # Or every 5 lines
+            
             for line in iter(process.stdout.readline, ''):
                 if line:
-                    self.output_lines.append(line.rstrip())
+                    line_stripped = line.rstrip()
+                    color = self.parse_output_color(line_stripped)
+                    self.output_lines.append((line_stripped, color))
+                    self.pending_output_lines.append((line_stripped, color))
+                    
                     # Auto-scroll to bottom while installing
                     height, _ = self.stdscr.getmaxyx()
                     visible_lines = height - 7
                     self.output_scroll_offset = max(0, len(self.output_lines) - visible_lines)
-                    self.draw_install_screen(package)
+                    
+                    # Batch updates: render if enough time passed or enough lines accumulated
+                    current_time = time.time()
+                    if (len(self.pending_output_lines) >= MAX_BATCH_SIZE or 
+                        (current_time - self.last_render_time) >= BATCH_INTERVAL):
+                        self.draw_install_screen(package)
+                        self.pending_output_lines = []
+                        self.last_render_time = current_time
             
+            # Final render
+            self.draw_install_screen(package)
             process.wait()
             self.install_success = (process.returncode == 0)
             
         except Exception as e:
-            self.output_lines.append(f"\nError: {str(e)}")
+            error_line = f"\nError: {str(e)}"
+            error_color = curses.color_pair(6) | curses.A_BOLD
+            self.output_lines.append((error_line, error_color))
             self.install_success = False
         
         self.state = "complete"
@@ -577,25 +664,33 @@ class ArchPackageManager:
         
         # Check if there's a sudo password prompt in recent output
         sudo_prompt = None
-        for line in self.output_lines[-5:]:  # Check last 5 lines
-            if '[sudo]' in line.lower() and 'password' in line.lower():
-                sudo_prompt = line.strip()
+        for line_data in self.output_lines[-5:]:  # Check last 5 lines
+            line_text = line_data[0] if isinstance(line_data, tuple) else line_data
+            if '[sudo]' in line_text.lower() and 'password' in line_text.lower():
+                sudo_prompt = line_text.strip()
                 break
         
-        for i, line in enumerate(display_lines):
+        for i, line_data in enumerate(display_lines):
             y = start_line + i
             if y >= height - 3:  # Leave room for sudo prompt
                 break
             
+            # Handle both tuple format (line, color) and legacy string format
+            if isinstance(line_data, tuple):
+                line_text, line_color = line_data
+            else:
+                line_text = line_data
+                line_color = curses.color_pair(4)
+            
             # Skip sudo password lines from regular output (they'll be shown at bottom)
-            if '[sudo]' in line.lower() and 'password' in line.lower():
+            if '[sudo]' in line_text.lower() and 'password' in line_text.lower():
                 continue
             
             # Truncate long lines
-            if len(line) > width - 4:
-                line = line[:width-7] + "..."
+            if len(line_text) > width - 4:
+                line_text = line_text[:width-7] + "..."
             
-            self.stdscr.addstr(y, 2, line, curses.color_pair(4))
+            self.stdscr.addstr(y, 2, line_text, line_color)
         
         # Display sudo password prompt at the bottom in green if present
         if sudo_prompt and self.state == "installing":
@@ -703,6 +798,7 @@ class ArchPackageManager:
                     # Return to search view to perform another search
                     self.state = "search"
                     self.output_lines = []
+                    self.pending_output_lines = []
                     self.output_scroll_offset = 0
                     # Refresh filter and (optionally) AUR search for current query
                     self.filtered_packages = self.filter_packages(self.search_query)
