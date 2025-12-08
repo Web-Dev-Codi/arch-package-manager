@@ -30,7 +30,7 @@ A beautiful terminal-based package manager for Arch Linux that searches both off
 
 1. **Clone or download this repository:**
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/Web-Dev-Codi/arch-package-manager
    cd aur-tui
    ```
 
