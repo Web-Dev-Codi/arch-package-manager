@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=AUR TUI
+Comment=Terminal-based package manager for Arch Linux and AUR
+Exec=aur-tui
+Icon=utilities-terminal
+Terminal=true
+Type=Application
+Categories=System;PackageManager;
+Keywords=arch;aur;package;manager;tui;
