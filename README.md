@@ -1,6 +1,6 @@
-# Arch Package Manager TUI
+# AUR TUI
 
-A beautiful terminal-based package manager for Arch Linux that searches both official repositories and the AUR, with Hyprland integration.
+A beautiful terminal-based package manager for Arch Linux that searches both official repositories and the AUR, with keyboard shortcut support.
 
 ## Features
 
@@ -14,8 +14,8 @@ A beautiful terminal-based package manager for Arch Linux that searches both off
 - 📊 Real-time installation output streaming
 - 🎨 Clean TUI with colored output
 - 📜 Scrollable package details panel
-- 🪟 Hyprland integration with floating, centered terminal window
-- 🚀 Standalone executable - no system Python pollution
+- 🪟 Window manager integration with floating, centered terminal window
+- 🚀 Proper Arch Linux package installation support
 
 ## Prerequisites
 
@@ -23,39 +23,71 @@ A beautiful terminal-based package manager for Arch Linux that searches both off
 - Arch Linux
 - `yay` (for AUR support - optional)
 - A terminal emulator (default: kitty)
-- Hyprland (for keybinding integration)
 
 ## Installation
 
+### Method 1: Using PKGBUILD (Recommended for Arch Linux)
+
+1. **Clone or download this repository:**
+   ```bash
+   git clone <repository-url>
+   cd aur-tui
+   ```
+
+2. **Build and install the package:**
+   ```bash
+   makepkg -si
+   ```
+
+   This will:
+   - Install all dependencies automatically
+   - Install `aur-tui` system-wide to `/usr/bin/aur-tui`
+   - Create a desktop entry for keyboard shortcuts
+   - Set up proper file permissions
+
+3. **Verify installation:**
+   ```bash
+   which aur-tui
+   aur-tui --help  # Should launch the TUI
+   ```
+
+### Method 2: Using install.sh (Manual Installation)
+
 1. **Run the installation script:**
    ```bash
-   cd /arch-package-manager
+   git clone <repository-url>
+   cd aur-tui
+   chmod +x install.sh
    ./install.sh
    ```
 
    This will:
-   - Create a Python virtual environment
-   - Install dependencies (rich library)
-   - Create the `arch-pkg` executable
-   - Create a symlink in `~/.local/bin` (if it exists)
+   - Install Python dependencies
+   - Create the `aur-tui` executable in `~/.local/bin`
+   - Add `~/.local/bin` to your PATH (if needed)
+   - Create a desktop entry for keyboard shortcuts
 
-2. **Hyprland is already configured:**
-   - Keybinding: `SUPER SHIFT + P` → launches arch-pkg
-   - Window rules: Terminal opens centered, floating, and pinned on top
-
-3. **Reload Hyprland:**
+2. **If `aur-tui` command is not found:**
    ```bash
-   hyprctl reload
+   export PATH="$HOME/.local/bin:$PATH"
+   # Or restart your terminal
    ```
-   Or press `SUPER + Shift + R`
+
+### Method 3: System-wide Installation (Requires sudo)
+
+```bash
+sudo INSTALL_METHOD=system ./install.sh
+```
+
+This installs `aur-tui` to `/usr/bin/aur-tui` system-wide.
 
 ## Usage
 
 ### Opening the App
 
-- **With Hyprland keybinding:** Press `SUPER SHIFT + P`
-- **From terminal:** Run `arch-pkg` (if ~/.local/bin is in your PATH)
-- **Manual launch:** Run `./arch-pkg` from the project directory
+- **From terminal:** Run `aur-tui`
+- **Using desktop entry:** Launch "AUR TUI" from your application menu
+- **Using keyboard shortcut:** Configure a keybinding (see Configuration section)
 
 ### Using the App
 
@@ -78,23 +110,49 @@ A beautiful terminal-based package manager for Arch Linux that searches both off
 
 ## Configuration
 
-### Change Keybinding
+### Setting Up Keyboard Shortcuts
+
+#### For Hyprland
 
 Edit `~/.config/hypr/bindings.conf`:
 ```conf
-bind = $mainMod, P, exec, arch-pkg
+bind = $mainMod, P, exec, aur-tui
+# Or use the launch script for window management:
+bind = $mainMod, P, exec, /usr/lib/aur-tui/launch.sh
 ```
 
-Change `$mainMod` (currently SUPER SHIFT) or `P` to your preference.
-
-### Change Window Size
-
-Edit `~/.config/hypr/windowrules.conf`:
+For window rules, edit `~/.config/hypr/windowrules.conf`:
 ```conf
-windowrulev2 = size 1000 700, class:^(arch-pkg-manager)$
+windowrulev2 = size 1000 700, class:^(aur-tui-manager)$
+windowrulev2 = float, class:^(aur-tui-manager)$
+windowrulev2 = center, class:^(aur-tui-manager)$
 ```
 
-Change `1000 700` to your preferred width and height.
+#### For i3wm
+
+Edit `~/.config/i3/config`:
+```conf
+bindsym $mod+p exec aur-tui
+```
+
+#### For Sway
+
+Edit `~/.config/sway/config`:
+```conf
+bindsym $mod+p exec aur-tui
+```
+
+#### For X11 (using sxhkd or similar)
+
+Edit `~/.config/sxhkd/sxhkdrc`:
+```conf
+super + p
+    aur-tui
+```
+
+#### Using Desktop Entry
+
+The desktop entry (`aur-tui.desktop`) allows you to set keyboard shortcuts through your desktop environment's settings (GNOME, KDE, XFCE, etc.).
 
 ### Change Terminal Emulator
 
@@ -107,27 +165,43 @@ Change `kitty` to your preferred terminal (e.g., `alacritty`, `foot`, `wezterm`)
 
 ## Troubleshooting
 
+### "aur-tui: command not found"
+- Ensure `~/.local/bin` is in your PATH: `echo $PATH | grep local`
+- Add to PATH: `export PATH="$HOME/.local/bin:$PATH"` (add to `~/.bashrc` or `~/.zshrc`)
+- Or reinstall using PKGBUILD method for system-wide installation
+
 ### "rich" module not found
-- Run the installation script: `./install.sh`
-- Ensure you're using the `arch-pkg` wrapper (not running Python directly)
+- Install dependencies: `pip install rich requests`
+- Or reinstall using the install script: `./install.sh`
+- For system-wide: `sudo pacman -S python-rich python-requests`
 
 ### AUR packages don't show up
-- Install `yay`: `sudo pacman -S yay`
+- Install `yay`: `yay -S yay` (or from AUR manually)
 - Check `yay` is in your PATH: `which yay`
+- Verify yay works: `yay -V`
 
-### Window doesn't float/center
+### Window doesn't float/center (Hyprland)
 - Ensure Hyprland configuration is loaded: `hyprctl reload`
-- Check window rules are applied: `hyprctl clients | grep arch-pkg-manager`
+- Check window rules are applied: `hyprctl clients | grep aur-tui-manager`
 - Verify terminal is launching with correct class: check `launch.sh`
+- Update window class in `launch.sh` if needed
 
 ### Packages won't install
 - Ensure you have sudo privileges
 - You'll be prompted for password during installation (this is normal)
 - For AUR packages, ensure `yay` is installed
+- Check pacman database is up to date: `sudo pacman -Sy`
 
 ### Terminal doesn't open
 - Check your terminal emulator is installed: `which kitty`
-- Change terminal in `launch.sh` if needed
+- Change terminal in `launch.sh` if needed: `TERMINAL=alacritty ./launch.sh`
+- Or set environment variable: `export TERMINAL=your-terminal`
+
+### Keyboard shortcut doesn't work
+- Verify `aur-tui` command works: `which aur-tui && aur-tui --version`
+- Check desktop entry exists: `ls ~/.local/share/applications/aur-tui.desktop` or `/usr/share/applications/aur-tui.desktop`
+- For window managers, ensure config is reloaded
+- For desktop environments, check keyboard shortcuts in settings
 
 ## Security Note
 
