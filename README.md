@@ -55,7 +55,7 @@ A beautiful terminal-based package manager for Arch Linux that searches both off
 
 1. **Run the installation script:**
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/Web-Dev-Codi/arch-package-manager
    cd aur-tui
    chmod +x install.sh
    ./install.sh
