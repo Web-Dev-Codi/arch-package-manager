@@ -1,0 +1,1 @@
+/run/media/webdevcodi/WorkStorage/Projects/Personal/arch-package-manager/requirements.txt
