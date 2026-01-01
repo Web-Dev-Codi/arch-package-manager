@@ -176,7 +176,7 @@ Change `kitty` to your preferred terminal (e.g., `alacritty`, `foot`, `wezterm`)
 - For system-wide: `sudo pacman -S python-rich python-requests`
 
 ### AUR packages don't show up
-- Install `yay`: `yay -S yay` (or from AUR manually)
+- Install `yay`: `sudo pacman -S yay` (or from AUR manually)
 - Check `yay` is in your PATH: `which yay`
 - Verify yay works: `yay -V`
 
